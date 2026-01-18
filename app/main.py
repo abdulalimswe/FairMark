@@ -308,10 +308,25 @@ async def evaluate_submission(req: EvaluateRequest):
 
         logger.info(f"✅ Comment generated ({len(comment)} chars)")
 
-        # Post comment to Canvas with attempt number in header
-        comment_with_metadata = f"[Attempt #{req.attempt}]\n\n{comment}"
+        # Get current UTC time for timestamp
+        from datetime import datetime, timezone
+        evaluation_time = datetime.now(timezone.utc)
+        utc_timestamp = evaluation_time.strftime("%Y-%m-%d %H:%M:%S UTC")
+
+        # Post comment to Canvas with metadata
+        # Canvas will automatically show this in user's local timezone
+        comment_with_metadata = f"""[Attempt #{req.attempt}]
+Evaluated at: {utc_timestamp}
+
+{comment}
+
+---
+💡 Note: This evaluation was generated automatically by FairMark AI.
+The timestamp shown is in UTC. Your browser will display it in your local timezone.
+"""
 
         logger.info(f"📤 Posting comment to Canvas...")
+        logger.info(f"   Timestamp: {utc_timestamp}")
         canvas.post_submission_comment(
             req.course_id,
             req.assignment_id,

@@ -5,8 +5,9 @@ Always-running service that monitors ALL Canvas submissions in real-time
 """
 import asyncio
 import logging
+import hashlib
 from datetime import datetime, timezone
-from typing import Dict, List, Set, Optional
+from typing import Dict, List, Set, Optional, Tuple
 import requests
 from .canvas_client import CanvasClient
 from .config import CANVAS_BASE_URL, CANVAS_TOKEN
@@ -34,7 +35,8 @@ class SubmissionWatcher:
         """
         self.check_interval = check_interval
         self.canvas = CanvasClient()
-        self.processed_submissions: Dict[str, Set[int]] = {}  # {assignment_key: {attempt_numbers}}
+        # Track file hashes: {assignment_key: {(attempt, file_hash)}}
+        self.processed_submissions: Dict[str, Set[Tuple[int, str]]] = {}
         self.api_base = "http://127.0.0.1:8000"
         self.is_running = False
 
@@ -43,6 +45,7 @@ class SubmissionWatcher:
         logger.info("=" * 70)
         logger.info(f"Check interval: {check_interval} seconds")
         logger.info(f"API endpoint: {self.api_base}")
+        logger.info(f"File change detection: ENABLED")
         logger.info("=" * 70)
 
     def get_all_active_courses(self) -> List[Dict]:
@@ -128,35 +131,71 @@ class SubmissionWatcher:
         """Generate unique key for tracking submissions"""
         return f"{course_id}_{assignment_id}_{user_id}"
 
+    def get_file_hash(self, file_url: str) -> Optional[str]:
+        """
+        Compute MD5 hash of file content to detect changes
+
+        Args:
+            file_url: URL of the file to download and hash
+
+        Returns:
+            MD5 hash string or None if error
+        """
+        try:
+            headers = {
+                "Authorization": f"Bearer {CANVAS_TOKEN}",
+            }
+            response = requests.get(file_url, headers=headers, timeout=30)
+            response.raise_for_status()
+
+            # Compute MD5 hash of file content
+            file_hash = hashlib.md5(response.content).hexdigest()
+            return file_hash
+
+        except Exception as e:
+            logger.error(f"❌ Error computing file hash: {e}")
+            return None
+
     def is_submission_new(
         self,
         course_id: int,
         assignment_id: int,
         user_id: int,
-        attempt: int
+        attempt: int,
+        file_hash: str
     ) -> bool:
-        """Check if this submission attempt has been processed"""
+        """
+        Check if this submission has been processed
+
+        Returns True if:
+        - Never seen this submission before, OR
+        - Same attempt but file content changed (re-upload)
+        """
         key = self.get_submission_key(course_id, assignment_id, user_id)
 
         if key not in self.processed_submissions:
             self.processed_submissions[key] = set()
 
-        return attempt not in self.processed_submissions[key]
+        # Check if we've seen this exact combination of attempt + file hash
+        submission_signature = (attempt, file_hash)
+        return submission_signature not in self.processed_submissions[key]
 
     def mark_submission_processed(
         self,
         course_id: int,
         assignment_id: int,
         user_id: int,
-        attempt: int
+        attempt: int,
+        file_hash: str
     ):
-        """Mark a submission attempt as processed"""
+        """Mark a submission as processed with its file hash"""
         key = self.get_submission_key(course_id, assignment_id, user_id)
 
         if key not in self.processed_submissions:
             self.processed_submissions[key] = set()
 
-        self.processed_submissions[key].add(attempt)
+        submission_signature = (attempt, file_hash)
+        self.processed_submissions[key].add(submission_signature)
 
     async def evaluate_submission(
         self,
@@ -221,25 +260,42 @@ class SubmissionWatcher:
         if workflow_state != "submitted":
             return
 
-        if not submission.get("attachments"):
+        attachments = submission.get("attachments")
+        if not attachments:
             return
 
         if not submitted_at:
             return
 
-        # Check if this attempt is new
-        if not self.is_submission_new(course_id, assignment_id, user_id, attempt):
+        # Get file hash to detect if file content changed
+        first_attachment = attachments[0]
+        file_url = first_attachment.get("url")
+
+        if not file_url:
+            logger.warning(f"   ⚠️  No file URL found for submission {submission_id}")
+            return
+
+        logger.info(f"   🔍 Computing file hash for change detection...")
+        file_hash = self.get_file_hash(file_url)
+
+        if not file_hash:
+            logger.warning(f"   ⚠️  Could not compute file hash, skipping")
+            return
+
+        # Check if this submission (attempt + file hash) is new
+        if not self.is_submission_new(course_id, assignment_id, user_id, attempt, file_hash):
             return
 
         logger.info("")
-        logger.info("🆕 NEW SUBMISSION DETECTED!")
+        logger.info("🆕 NEW/UPDATED SUBMISSION DETECTED!")
         logger.info(f"   📚 Course: {course_id}")
         logger.info(f"   📋 Assignment: {assignment_name} (ID: {assignment_id})")
         logger.info(f"   👤 Student: {user_id}")
         logger.info(f"   📄 Submission ID: {submission_id}")
         logger.info(f"   🔢 Attempt: {attempt}")
+        logger.info(f"   🔐 File Hash: {file_hash[:8]}...")
         logger.info(f"   ⏰ Submitted: {submitted_at}")
-        logger.info(f"   📎 Attachments: {len(submission.get('attachments', []))}")
+        logger.info(f"   📎 Attachments: {len(attachments)}")
 
         # Evaluate the submission
         result = await self.evaluate_submission(
@@ -252,8 +308,8 @@ class SubmissionWatcher:
         )
 
         if result:
-            # Mark as processed
-            self.mark_submission_processed(course_id, assignment_id, user_id, attempt)
+            # Mark as processed with file hash
+            self.mark_submission_processed(course_id, assignment_id, user_id, attempt, file_hash)
             logger.info(f"   ✅ Submission processed successfully!")
         else:
             logger.error(f"   ❌ Failed to process submission")

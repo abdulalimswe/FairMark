@@ -1,5 +1,32 @@
+# Environment and secrets
 .env
+
+# Virtual environment
 .venv
-.idea
 .venv/
+
+# IDE
+.idea
 .idea/
+
+# Logs
+*.log
+logs/
+fairmark_v2.log
+
+# Temporary files
+*.tmp
+*.temp
+.fairmark_processed.json
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
